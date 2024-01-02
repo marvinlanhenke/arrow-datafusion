@@ -18,11 +18,12 @@
 //! Execution plan for reading line-delimited JSON files
 
 use std::any::Any;
-use std::io::{BufReader, Read, Seek, SeekFrom};
+use std::io::{BufRead, BufReader, Cursor, Seek, SeekFrom};
+use std::ops::Range;
 use std::sync::Arc;
 use std::task::Poll;
 
-use super::{calculate_range, FileGroupPartitioner, FileScanConfig, RangeCalculation};
+use super::{FileGroupPartitioner, FileScanConfig};
 use crate::datasource::file_format::file_compression_type::FileCompressionType;
 use crate::datasource::listing::ListingTableUrl;
 use crate::datasource::physical_plan::file_stream::{
@@ -233,17 +234,23 @@ impl FileOpener for JsonOpener {
         let schema = self.projected_schema.clone();
         let batch_size = self.batch_size;
         let file_compression_type = self.file_compression_type.to_owned();
+        let file_size = file_meta.object_meta.size;
+        let ext_end_bytes = 1024 * 1000 as usize;
 
         Ok(Box::pin(async move {
-            let calculated_range = calculate_range(&file_meta, &store).await?;
+            let (start, end, range) = match &file_meta.range {
+                None => (0, 0, None),
+                Some(r) => {
+                    let start = r.start as usize;
+                    let end = r.end as usize;
 
-            let range = match calculated_range {
-                RangeCalculation::Range(None) => None,
-                RangeCalculation::Range(Some(range)) => Some(range),
-                RangeCalculation::TerminateEarly => {
-                    return Ok(
-                        futures::stream::poll_fn(move |_| Poll::Ready(None)).boxed()
-                    )
+                    let ext_end = (end + ext_end_bytes).min(file_size);
+
+                    let extended_range = Some(Range {
+                        start,
+                        end: ext_end,
+                    });
+                    (start, end, extended_range)
                 }
             };
 
@@ -256,12 +263,41 @@ impl FileOpener for JsonOpener {
 
             match result.payload {
                 GetResultPayload::File(mut file, _) => {
-                    let bytes = match file_meta.range {
+                    let bytes = match &file_meta.range {
                         None => file_compression_type.convert_read(file)?,
                         Some(_) => {
-                            file.seek(SeekFrom::Start(result.range.start as _))?;
-                            let limit = result.range.end - result.range.start;
-                            file_compression_type.convert_read(file.take(limit as u64))?
+                            file.seek(SeekFrom::Start(start as u64))?;
+
+                            let mut reader = BufReader::new(file);
+                            let mut buf = String::new();
+                            let mut total_bytes_read = 0;
+
+                            while let Ok(bytes_read) = reader.read_line(&mut buf) {
+                                if bytes_read == 0 {
+                                    break;
+                                }
+
+                                if buf.ends_with('\n') {
+                                    if start != 0 && total_bytes_read == 0 {
+                                        buf.clear();
+                                    }
+                                } else {
+                                    if end != file_size {
+                                        let new_len = buf.len() - bytes_read;
+                                        buf.truncate(new_len)
+                                    }
+                                }
+
+                                total_bytes_read += bytes_read;
+
+                                if total_bytes_read >= (end - start) {
+                                    break;
+                                }
+                            }
+
+                            let cursor = Cursor::new(buf);
+
+                            file_compression_type.convert_read(cursor)?
                         }
                     };
 
@@ -273,37 +309,69 @@ impl FileOpener for JsonOpener {
                 }
                 GetResultPayload::Stream(s) => {
                     let s = s.map_err(DataFusionError::from);
+                    let mut s_ref =
+                        file_compression_type.convert_stream(s.boxed())?.fuse();
 
                     let mut decoder = ReaderBuilder::new(schema)
                         .with_batch_size(batch_size)
                         .build_decoder()?;
-                    let mut input =
-                        file_compression_type.convert_stream(s.boxed())?.fuse();
+
                     let mut buffer = Bytes::new();
+                    let mut should_flush = false;
+                    let mut total_bytes_read = 0;
+                    let range = end - start;
 
                     let s = futures::stream::poll_fn(move |cx| {
                         loop {
-                            if buffer.is_empty() {
-                                match ready!(input.poll_next_unpin(cx)) {
-                                    Some(Ok(b)) => buffer = b,
+                            if buffer.is_empty() && !should_flush {
+                                match ready!(s_ref.poll_next_unpin(cx)) {
+                                    Some(Ok(chunk)) => {
+                                        if range == 0 {
+                                            buffer = chunk;
+                                        } else {
+                                            let mut buf = String::new();
+                                            let mut r = chunk.reader();
+
+                                            while let Ok(b) = r.read_line(&mut buf) {
+                                                if b == 0 {
+                                                    break;
+                                                }
+
+                                                if buf.ends_with('\n') {
+                                                    if start != 0 && total_bytes_read == 0
+                                                    {
+                                                        buf.clear();
+                                                    }
+                                                }
+
+                                                total_bytes_read += b;
+
+                                                if total_bytes_read >= range {
+                                                    should_flush = true;
+                                                    break;
+                                                }
+                                            }
+                                            buffer = Bytes::from(buf);
+                                        }
+                                    }
                                     Some(Err(e)) => {
                                         return Poll::Ready(Some(Err(e.into())))
                                     }
                                     None => {}
-                                };
+                                }
                             }
 
-                            let decoded = match decoder.decode(buffer.as_ref()) {
+                            let cnt = match decoder.decode(&buffer) {
                                 Ok(0) => break,
-                                Ok(decoded) => decoded,
-                                Err(e) => return Poll::Ready(Some(Err(e))),
+                                Ok(cnt) => cnt,
+                                Err(e) => return Poll::Ready(Some(Err(e.into()))),
                             };
 
-                            buffer.advance(decoded);
+                            buffer.advance(cnt);
                         }
-
                         Poll::Ready(decoder.flush().transpose())
                     });
+
                     Ok(s.boxed())
                 }
             }
