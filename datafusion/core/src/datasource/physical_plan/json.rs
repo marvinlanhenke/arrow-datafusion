@@ -18,7 +18,7 @@
 //! Execution plan for reading line-delimited JSON files
 
 use std::any::Any;
-use std::io::{BufRead, BufReader, Cursor, Seek, SeekFrom};
+use std::io::{BufRead, BufReader, Cursor, Read, Seek, SeekFrom};
 use std::ops::Range;
 use std::sync::Arc;
 use std::task::Poll;
@@ -266,9 +266,12 @@ impl FileOpener for JsonOpener {
                     let bytes = match &file_meta.range {
                         None => file_compression_type.convert_read(file)?,
                         Some(_) => {
+                            let limit = result.range.end - result.range.start;
                             file.seek(SeekFrom::Start(start as u64))?;
+                            let f = file_compression_type
+                                .convert_read(file.take(limit as u64))?;
 
-                            let mut reader = BufReader::new(file);
+                            let mut reader = BufReader::new(f);
                             let mut buf = String::new();
                             let mut total_bytes_read = 0;
 
@@ -295,9 +298,7 @@ impl FileOpener for JsonOpener {
                                 }
                             }
 
-                            let cursor = Cursor::new(buf);
-
-                            file_compression_type.convert_read(cursor)?
+                            Box::new(Cursor::new(buf))
                         }
                     };
 
